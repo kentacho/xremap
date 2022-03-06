@@ -1,7 +1,7 @@
 use crate::client::{build_client, WMClient};
 use crate::config::action::Action;
 use crate::config::application::Application;
-use crate::config::key_action::KeyAction;
+use crate::config::key_action::{KeyAction, StickyKey};
 use crate::config::key_press::{KeyPress, Modifier, ModifierState};
 use crate::config::keymap::expand_modifiers;
 use crate::Config;
@@ -44,6 +44,7 @@ pub struct EventHandler {
     mark_set: bool,
     // { escape_next_key: true }
     escape_next_key: bool,
+    sticky_key: StickyKeyManager,
 }
 
 impl EventHandler {
@@ -64,6 +65,7 @@ impl EventHandler {
             sigaction_set: false,
             mark_set: false,
             escape_next_key: false,
+            sticky_key: StickyKeyManager::new(),
         }
     }
 
@@ -73,8 +75,12 @@ impl EventHandler {
         let key = Key::new(event.code());
         debug!("=> {}: {:?}", event.value(), &key);
 
+        let mut sticky_key = None;
         // Apply modmap
         let mut key_values = if let Some(key_action) = self.find_modmap(config, &key) {
+            if let KeyAction::StickyKey(sticky_key_) = &key_action {
+                sticky_key = Some(sticky_key_.clone());
+            }
             self.dispatch_keys(key_action, key, event.value())
         } else {
             vec![(key, event.value())]
@@ -98,8 +104,19 @@ impl EventHandler {
                     continue;
                 }
             }
-            self.send_key(&key, value)?;
+            if let Some(sticky_shift) = self.sticky_key.get_sticky_shift(key) {
+                let next_shift = PressState {
+                    left: self.shift.left || sticky_shift.left,
+                    right: self.shift.right || sticky_shift.right,
+                };
+                let prev_shift = self.send_modifier(Modifier::Shift, &next_shift)?;
+                self.send_key(&key, value)?;
+                self.send_modifier(Modifier::Shift, &prev_shift)?;
+            } else {
+                self.send_key(&key, value)?;
+            }
         }
+        self.sticky_key.update(sticky_key, event.value());
         Ok(())
     }
 
@@ -177,6 +194,9 @@ impl EventHandler {
                 }
                 // fallthrough on state discrepancy
                 vec![(key, value)]
+            }
+            KeyAction::StickyKey(sticky_key) => {
+                vec![(sticky_key.sticky, value)]
             }
         }
     }
@@ -571,5 +591,78 @@ impl MultiPurposeKeyState {
         } else {
             vec![]
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StickyKeyState {
+    sticky: Key,
+    sticky_timeout_at: Instant,
+}
+
+#[derive(Debug)]
+struct StickyKeyManager {
+    last_pressed_key: Option<Key>,
+    state: Option<StickyKeyState>,
+}
+
+fn is_sticky_target_key(key: Key) -> bool {
+    (Key::KEY_1 <= key && key <= Key::KEY_EQUAL)
+        || (Key::KEY_Q <= key && key <= Key::KEY_RIGHTBRACE)
+        || (Key::KEY_A <= key && key <= Key::KEY_GRAVE)
+        || (Key::KEY_BACKSLASH <= key && key <= Key::KEY_SLASH)
+        || key == Key::KEY_RO
+}
+
+impl StickyKeyManager {
+    fn new() -> Self {
+        Self {
+            last_pressed_key: None,
+            state: None,
+        }
+    }
+
+    fn update(&mut self, sticky_key: Option<StickyKey>, value: i32) {
+        self.state = None;
+        if let Some(sticky_key) = sticky_key {
+            if let Some(last_pressed_key) = self.last_pressed_key {
+                if last_pressed_key == sticky_key.sticky && value == RELEASE {
+                    self.state = Some(StickyKeyState {
+                        sticky: sticky_key.sticky,
+                        sticky_timeout_at: Instant::now() + sticky_key.sticky_timeout,
+                    });
+                }
+            }
+            if value == PRESS {
+                self.last_pressed_key = Some(sticky_key.sticky);
+            }
+        } else {
+            if value == PRESS {
+                self.last_pressed_key = None;
+            }
+        }
+    }
+
+    fn get_sticky_shift(&self, key: Key) -> Option<PressState> {
+        if let Some(state) = &self.state {
+            if is_sticky_target_key(key) && Instant::now() < state.sticky_timeout_at {
+                match state.sticky {
+                    Key::KEY_LEFTSHIFT => {
+                        return Some(PressState {
+                            left: true,
+                            right: false,
+                        });
+                    }
+                    Key::KEY_RIGHTSHIFT => {
+                        return Some(PressState {
+                            left: false,
+                            right: true,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
     }
 }

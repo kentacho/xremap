@@ -11,6 +11,7 @@ pub enum KeyAction {
     #[serde(deserialize_with = "deserialize_key")]
     Key(Key),
     MultiPurposeKey(MultiPurposeKey),
+    StickyKey(StickyKey),
 }
 
 #[serde_as]
@@ -27,4 +28,18 @@ pub struct MultiPurposeKey {
 
 fn default_alone_timeout() -> Duration {
     Duration::from_millis(1000)
+}
+
+#[serde_as]
+#[derive(Clone, Debug, Deserialize)]
+pub struct StickyKey {
+    #[serde(deserialize_with = "deserialize_key")]
+    pub sticky: Key,
+    #[serde_as(as = "DurationMilliSeconds")]
+    #[serde(default = "default_sticky_timeout", rename = "sticky_timeout_millis")]
+    pub sticky_timeout: Duration,
+}
+
+fn default_sticky_timeout() -> Duration {
+    Duration::from_millis(500)
 }
