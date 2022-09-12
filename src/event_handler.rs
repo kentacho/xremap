@@ -1,7 +1,7 @@
 use crate::client::{build_client, WMClient};
 use crate::config::action::Action;
 use crate::config::application::Application;
-use crate::config::key_action::{KeyAction, MultiPurposeKey, PressReleaseKey};
+use crate::config::key_action::{KeyAction, MultiPurposeKey, PressReleaseKey, StickyKey};
 use crate::config::key_press::{KeyPress, Modifier};
 use crate::config::keymap::{build_override_table, OverrideEntry};
 use crate::config::remap::Remap;
@@ -47,6 +47,7 @@ pub struct EventHandler {
     mark_set: bool,
     // { escape_next_key: true }
     escape_next_key: bool,
+    sticky_key: StickyKeyManager,
 }
 
 impl EventHandler {
@@ -66,6 +67,7 @@ impl EventHandler {
             mode: mode.to_string(),
             mark_set: false,
             escape_next_key: false,
+            sticky_key: StickyKeyManager::new(),
         }
     }
 
@@ -75,8 +77,12 @@ impl EventHandler {
         let key = Key::new(event.code());
         debug!("=> {}: {:?}", event.value(), &key);
 
+        let mut sticky_key = None;
         // Apply modmap
         let mut key_values = if let Some(key_action) = self.find_modmap(config, &key) {
+            if let KeyAction::StickyKey(sticky_key_) = &key_action {
+                sticky_key = Some(sticky_key_.clone());
+            }
             self.dispatch_keys(key_action, key, event.value())?
         } else {
             vec![(key, event.value())]
@@ -101,8 +107,19 @@ impl EventHandler {
                     continue;
                 }
             }
-            self.send_key(&key, value)?;
+            if let Some(sticky_modifier) = self.sticky_key.get_sticky_modifier(key) {
+                if self.modifiers.contains(&sticky_modifier) {
+                    self.send_key(&key, value)?;
+                } else {
+                    self.send_key(&sticky_modifier, PRESS)?;
+                    self.send_key(&key, value)?;
+                    self.send_key(&sticky_modifier, RELEASE)?;
+                }
+            } else {
+                self.send_key(&key, value)?;
+            }
         }
+        self.sticky_key.update(sticky_key, event.value());
         Ok(())
     }
 
@@ -208,6 +225,9 @@ impl EventHandler {
                 }
                 // Dispatch the original key as well
                 vec![(key, value)]
+            }
+            KeyAction::StickyKey(sticky_key) => {
+                vec![(sticky_key.sticky, value)]
             }
         };
         Ok(keys)
@@ -562,5 +582,65 @@ impl MultiPurposeKeyState {
         } else {
             vec![]
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StickyKeyState {
+    sticky: Key,
+    sticky_timeout_at: Instant,
+}
+
+#[derive(Debug)]
+struct StickyKeyManager {
+    last_pressed_key: Option<Key>,
+    state: Option<StickyKeyState>,
+}
+
+fn is_sticky_target_key(key: Key) -> bool {
+    (Key::KEY_1 <= key && key <= Key::KEY_EQUAL)
+        || (Key::KEY_Q <= key && key <= Key::KEY_RIGHTBRACE)
+        || (Key::KEY_A <= key && key <= Key::KEY_GRAVE)
+        || (Key::KEY_BACKSLASH <= key && key <= Key::KEY_SLASH)
+        || key == Key::KEY_RO
+}
+
+impl StickyKeyManager {
+    fn new() -> Self {
+        Self {
+            last_pressed_key: None,
+            state: None,
+        }
+    }
+
+    fn update(&mut self, sticky_key: Option<StickyKey>, value: i32) {
+        self.state = None;
+        if let Some(sticky_key) = sticky_key {
+            if let Some(last_pressed_key) = self.last_pressed_key {
+                if last_pressed_key == sticky_key.sticky && value == RELEASE {
+                    self.state = Some(StickyKeyState {
+                        sticky: sticky_key.sticky,
+                        sticky_timeout_at: Instant::now() + sticky_key.sticky_timeout,
+                    });
+                }
+            }
+            if value == PRESS {
+                self.last_pressed_key = Some(sticky_key.sticky);
+            }
+        } else {
+            if value == PRESS {
+                self.last_pressed_key = None;
+            }
+        }
+    }
+
+    fn get_sticky_modifier(&self, key: Key) -> Option<Key> {
+        self.state.as_ref().and_then(|state| {
+            if is_sticky_target_key(key) && Instant::now() < state.sticky_timeout_at {
+                Some(state.sticky)
+            } else {
+                None
+            }
+        })
     }
 }
